@@ -1,0 +1,402 @@
+package distributedsemaphor;
+
+import utils.LogicalClock;
+import utils.Message;
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.net.Socket;
+import java.net.UnknownHostException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+/**
+ * This class models a Helper process for a DistributedSemaphore object.
+ * This class will talk to other Helper objects in a peer-to-peer manner.
+ * 
+ */
+public class Helper extends Thread {
+    
+    private static final int SLEEP_TIME_MS = 50;
+
+    private LogicalClock clock; //the logocal clock for this helper
+    private int semaphore; //the semaphore value 
+    
+    private PrintWriter[] outputStreams; //streams to write to all the connected nodes
+    private PrintWriter parentWriter; //a writer to send messages to the parent process
+    
+    ArrayList<Message> queue; //a message queue, will be useded as a priority queue.
+                              //the queue will have the lowest timestamp value at
+                              //the head
+    String parentName; //the name of the parent object that created this helper
+    
+    private boolean running;
+
+    /**
+     * Will create a new Helper object with the given parameters.
+     * 
+     * During construction of this Helper, the connection to the parent Object
+     * and the other nodes.
+     * 
+     * @param parentName The unique name of the parent DistributedSemaphore object
+     * @param inputs The array of Sockets to be used as InputStreams
+     * @param outputs The array of Sockets to be used as OutputStreams
+     * @param parentPort The port of the parent DistributedSemaphore that this
+     *                   object will talk to on
+     */
+    public Helper(String parentName, Socket[] inputs, Socket[] outputs, int parentPort) {
+
+        semaphore = 1;
+        clock = new LogicalClock();
+        this.parentName = parentName;
+        running = true;
+        
+        queue = new ArrayList<Message>();
+        outputStreams = new PrintWriter[outputs.length];
+
+        this.connectToParent(parentPort);
+
+        this.createStreamsToNodes(inputs, outputs);
+    }
+
+    /**
+     * Will broadcast the given message to all the other connected nodes.
+     * 
+     * @param message The message array be formatted as follows:
+     *                  message[0] = timestamp
+     *                  message[1] = message kind (POP,VOP,ACK)
+     *                  if message[1] == Message.ACK
+     *                     message[2] = POP || VOP
+     *                     message[3] = sender of POP || VOP
+     */
+    synchronized void broadcast(String... message) {
+        String toSend = "";
+
+        //build the message string to send
+        for (String string : message) {
+            toSend += string + ",";
+        }
+       
+        //send the message string to the other nodes
+        for (PrintWriter writer : outputStreams) {
+            try {
+                Thread.currentThread().sleep(Helper.SLEEP_TIME_MS);
+            } catch (InterruptedException ex) {
+//                Logger.getLogger(Helper.class.getName()).log(Level.SEVERE, null, ex);
+            }
+            
+            writer.println(toSend);
+            //System.out.println("Message : "+toSend);
+        }
+    }
+    
+    synchronized void close(){
+        
+        broadcast(parentName,clock.getTime()+"",Message.CLOSE);
+        
+        for (int i = 0 ; i < outputStreams.length; i++) {
+            outputStreams[i].close();
+        }
+        
+        running = false;
+        Thread.currentThread().interrupt();
+    }
+
+    /**
+     * The handler for ACK messages.
+     * 
+     * @param message   message[0] = sender 
+     *                  message[1] = timestamp 
+     *                  message[2] = Message.ACK
+     *                  message[3] = kind of acknowledged 
+     *                  message[4] = sender of original message
+     */
+    synchronized void ack(String[] message) {
+               
+        
+        //record the ACK message
+        recordAck(message[3], message[4]);
+        
+        //check for fully acknowledged VOP messages
+        checkFullyAckVOP();
+        
+        //check for fully acknowledged POP messages
+        checkFullyAckPOP();
+        
+        long[] waterMark = new long[outputStreams.length];
+        
+        updateFullyAcknowledged(message, clock.getTime(), waterMark);
+        
+    }
+    
+    synchronized void updateFullyAcknowledged(String[] message, long timestamp, long[] waterMark){
+    	long fullyAckTimeStamp = 0;
+    	for (int i = 0; i < queue.size(); i++) {
+            Message mess = queue.get(i);
+            
+            if(mess.getSender().equalsIgnoreCase("test1")){
+            	waterMark[0] = mess.getTimeStamp();
+            }
+            else if(mess.getSender().equalsIgnoreCase("test2")){
+            	waterMark[1] = mess.getTimeStamp();
+            }
+            else if(mess.getSender().equalsIgnoreCase("test3")){
+            	waterMark[2] = mess.getTimeStamp();
+            }
+            else if(mess.getSender().equalsIgnoreCase("test4")){
+            	waterMark[3] = mess.getTimeStamp();
+            }
+                      
+            
+            //if the message matches the given parameters then mark it as
+            //acknowledged
+            if (mess.getSender().equals(message[4]) && mess.getMessage().equals(message[3])) {
+//                if (mess.getMessage().equals(messageKind)) {
+                
+                mess.acknowledged();//tell the message that it has an ACK                
+                
+                //i = queue.size(); //end loop early
+            }
+            
+            fullyAckTimeStamp = waterMark[0];
+            for(int k = 0; k < waterMark.length; k++){
+            	if(fullyAckTimeStamp < waterMark[k]){
+            		fullyAckTimeStamp = waterMark[k];
+            	}
+            }
+        }
+    	
+    	//look for fully acknowledged Message.VOP messages
+        for (int i = 0; i < queue.size(); i++) {
+            Message mess = queue.get(i);
+
+            //if the message is a VOp message, then check the number of 
+            //acknowledgments
+            if (mess.getMessage().equals(Message.VOP)) {
+            	if(mess.getTimeStamp() < fullyAckTimeStamp){
+            		queue.remove(i);
+                    semaphore++;
+            	}
+                /*//if it has been fully acknowledged, then remove it from the queue
+                if (mess.getNumberOfACKs() == outputStreams.length) {
+                	//System.out.println("Fully Acknowledged VOP :"+queue.get(i).toString());
+                    queue.remove(i);
+                    semaphore++;
+                }//end if*/
+            }//end if
+            else if(mess.getMessage().equals(Message.POP)){
+            	if(mess.getTimeStamp() < fullyAckTimeStamp){
+            		queue.remove(i);
+                    semaphore++;
+            	}
+            /*	
+            	if (mess.getNumberOfACKs() == outputStreams.length && semaphore > 0) {
+                    if (mess.getSender().equals(parentName)) {
+                        try {
+                            Thread.currentThread().sleep(Helper.SLEEP_TIME_MS);
+                            parentWriter.println(clock.getTime() + "");
+                            clock.tick();
+                        } catch (InterruptedException ex) {
+                        }
+                    }
+                    //System.out.println("Fully Acknowledged POP :"+queue.get(i).toString());
+                    queue.remove(i);
+                    semaphore--;
+                }*/
+            }
+        }//end if
+      
+    }
+    
+    /**
+     * The handler for POP messages
+     */
+    synchronized void requestP() {
+        try {
+            Thread.currentThread().sleep(Helper.SLEEP_TIME_MS);
+            broadcast(parentName, clock.getTime() + "", Message.POP);
+            clock.tick();
+    //        System.out.println(parentName +": " +queue);
+        } catch (InterruptedException ex) {
+//            Logger.getLogger(Helper.class.getName()).log(Level.SEVERE, null, ex);
+        }
+    }
+
+    /**
+     * The handler for VOP messages
+     */
+    synchronized void requestV() {
+        try {
+            Thread.currentThread().sleep(Helper.SLEEP_TIME_MS);
+            broadcast(parentName, clock.getTime() + "", Message.VOP);
+            clock.tick();
+    //        System.out.println(parentName +": " +queue);
+        } catch (InterruptedException ex) {
+//            Logger.getLogger(Helper.class.getName()).log(Level.SEVERE, null, ex);
+        }
+    }
+
+    
+    synchronized void op(String... message) {
+        //add the recieved messagte to the queue
+        queue.add(new Message(message[0], message[2], Long.valueOf(message[1])));
+
+        //resort the list by the timestamp of the messages
+        Collections.sort(queue, new Comparator<Message>() {
+
+            @Override
+            public int compare(Message o1, Message o2) {
+                int result = 0;
+
+                if (o1.getTimeStamp() > o2.getTimeStamp()) {
+                    result = 1;
+                }
+                else if (o1.getTimeStamp() < o2.getTimeStamp()) {
+                    result = -1;
+                }
+
+                return result;
+            }
+        });
+        try {
+            Thread.currentThread().sleep(Helper.SLEEP_TIME_MS);
+        } catch (InterruptedException ex) {
+//            Logger.getLogger(Helper.class.getName()).log(Level.SEVERE, null, ex);
+        }
+        broadcast(parentName, clock.getTime() + "", Message.ACK, message[2], message[0]);
+        System.out.println(parentName+" : "+clock.getTime() + " : "+ Message.ACK +" : "+ message[2] +" : "+ message[0]);
+        clock.tick();
+        
+//        System.out.println(parentName +": " +queue);
+    }
+
+    /**
+     * The overriden method from Thread.
+     * 
+     * While cause the Helper to run indefinity.
+     */
+    @Override
+    public void run() {
+        while (!this.isInterrupted() && running);
+    }
+       
+    /**
+     * Check the queue for fully acknowledged VOP messages 
+     */
+    private synchronized  void checkFullyAckVOP(){
+        
+        //look for fully acknowledged Message.VOP messages
+        for (int i = 0; i < queue.size(); i++) {
+            Message mess = queue.get(i);
+
+            //if the message is a VOp message, then check the number of 
+            //acknowledgments
+            if (mess.getMessage().equals(Message.VOP)) {
+                //if it has been fully acknowledged, then remove it from the queue
+                if (mess.getNumberOfACKs() == outputStreams.length) {
+                	//System.out.println("Fully Acknowledged VOP :"+queue.get(i).toString());
+                    queue.remove(i);
+                    semaphore++;
+                }//end if
+            }//end if
+        }//end if
+    }
+    
+    /**
+     * Check for fully acknowledged POP messages
+     */
+    private synchronized void checkFullyAckPOP(){
+        //look for fully acknowledged Message.POP messages
+        for (int i = 0; i < queue.size(); i++) {
+            Message mess = queue.get(i);
+            
+            //if the message is a POP messages, then check the number of
+            //acknowledgements
+            if (mess.getMessage().equals(Message.POP)) {
+                //if the message has been fully acknowledged and the semaphore
+                //value is > 0, remove it from the queue.
+                if (mess.getNumberOfACKs() == outputStreams.length && semaphore > 0) {
+                    
+                    //if the request was from my parent object, then notify
+                    //them that they may proceed
+                    if (mess.getSender().equals(parentName)) {
+                        try {
+                            Thread.currentThread().sleep(Helper.SLEEP_TIME_MS);
+                            parentWriter.println(clock.getTime() + "");
+                            clock.tick();
+                        } catch (InterruptedException ex) {
+                        }
+                    }
+                    //System.out.println("Fully Acknowledged POP :"+queue.get(i).toString());
+                    queue.remove(i);
+                    semaphore--;
+                }//end  number of acks and s > 0
+            }//end message == Message.POP
+        }//end for
+    }
+    
+    /**
+     * Create the streams to the other nodes.
+     * 
+     * @param inputs The Socket array to be used to create the InputStreams 
+     *               from the other nodes.
+     * @param outputs The Socket array to be used to create the OutputStreams
+     *                to the other nodes.
+     */
+    private void createStreamsToNodes(Socket[] inputs, Socket[] outputs) {
+        for (int i = 0; i < inputs.length; i++) {
+            
+            try {
+                //create a new stream listener to listen to message from the
+                //other nodes
+                new HelperStreamListener(inputs[i], this, clock).start();
+                //create the OutputStream to the other nodes
+                outputStreams[i] = new PrintWriter(outputs[i].getOutputStream(), true);
+            } catch (IOException ex) {
+//                System.err.println("ERROR: " + ex.getMessage());
+            }
+        }
+    }
+    
+    /**
+     * Create a connection to the parent DistributedSemaphore object
+     * 
+     * @param parentPort The port that the parent object is listening on
+     */
+    private void connectToParent(int parentPort) {
+        Socket parent = null;
+        //keep trying to establish a connection to the parent object
+        do {
+            try {
+                parent = new Socket("localhost", parentPort);
+                new HelperStreamListener(parent, this, clock).start();
+                parentWriter = new PrintWriter(parent.getOutputStream(), true);
+            } catch (UnknownHostException ex) {
+//                System.err.println("ERROR: " + ex.getMessage());
+            } catch (IOException ex) {
+//                System.err.println("ERROR: " + ex.getMessage());
+            }
+        } while (parent == null);
+    }
+    
+    /**
+     * Record a message as acknowledged.
+     */
+    private synchronized void recordAck(String messageKind, String sender){
+         for (int i = 0; i < queue.size(); i++) {
+            Message mess = queue.get(i);
+            
+            //if the message matches the given parameters then mark it as
+            //acknowledged
+            if (mess.getSender().equals(sender) && mess.getMessage().equals(messageKind)) {
+//                if (mess.getMessage().equals(messageKind)) {
+                
+                mess.acknowledged();//tell the message that it has an ACK                
+                
+                i = queue.size(); //end loop early
+            }
+        }//end loop
+    }
+}
